@@ -1,0 +1,7 @@
+bumpversion
+pip
+pytest
+pytest-cov
+tox
+twine
+wheel
