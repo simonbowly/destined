@@ -4,7 +4,7 @@
 # before executing func() and/or repeat the result check after
 # resetting all the mocks.
 
-from unittest.mock import Mock
+from mock import Mock
 
 import pytest
 

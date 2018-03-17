@@ -82,8 +82,8 @@ def evaluate_distribution(spec, function_lookup):
         def wrapper(rstate, **kwargs):
             missing_kwargs = set(_exposed_kwargs) - set(kwargs)
             if missing_kwargs:
-                str_missed = ', '.join(f'\'{kw}\'' for kw in sorted(missing_kwargs))
-                raise TypeError(f'function missing required keyword-only arguments: {str_missed}')
+                str_missed = ', '.join('\'{}\''.format(kw) for kw in sorted(missing_kwargs))
+                raise TypeError('function missing required keyword-only arguments: {}'.format(str_missed))
             inner_kwargs = {
                 inner_kw: kwargs[outer_kw]
                 for inner_kw, outer_kw in exposed_kwargs_map.items()
