@@ -8,7 +8,7 @@ from mock import Mock
 
 import pytest
 
-from destined import evaluate_distribution
+from destined.distribution import evaluate_distribution
 
 
 def test_value():

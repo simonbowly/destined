@@ -1,0 +1,21 @@
+{
+    "instances": {
+        "generator": "graphs.undirected_noloop_erdos_renyi_np",
+        "parameters": {
+            "nodes": {
+                "generator": "choice",
+                "parameters": {
+                    "seq": {"value": [10, 20, 50, 100]}
+                }
+            },
+            "prob": {
+                "generator": "uniform",
+                "parameters": {
+                    "low": {"value": 0},
+                    "high": {"value": 0.6}
+                }
+            }
+        }
+    },
+    "attributes": "graphs.features"
+}
