@@ -4,6 +4,8 @@ import functools
 import itertools
 import json
 import random
+import signal
+import subprocess
 import sys
 import time
 
@@ -48,7 +50,8 @@ def main():
 @click.argument('specification-file', type=click.File('r'))
 @click.argument('output-file', type=click.File('w'))
 @click.option('--samples', type=int, default=1000)
-def evaluate(specification_file, output_file, samples):
+@click.option('--progress/--no-progress', default=True)
+def evaluate(specification_file, output_file, samples, progress):
     ''' Serial processor. '''
 
     # Sampling function built from specification.
@@ -60,9 +63,11 @@ def evaluate(specification_file, output_file, samples):
 
     # Mapper.
     delayed = map(sample, system_seeds)
+    if progress:
+        delayed = tqdm.tqdm(delayed, smoothing=0)
 
     # Run the thing.
-    for entry in tqdm.tqdm(delayed, smoothing=0):
+    for entry in delayed:
         json.dump(entry, output_file)
         output_file.write('\n')
 
@@ -148,7 +153,8 @@ def request_client(output_file, samples, chunk, port):
 @click.argument('output-file', type=click.File('w'))
 @click.option('--port', type=int, default=5558)
 @click.option('--continuous/--no-continuous', default=False)
-def sink(output_file, port, continuous):
+@click.option('--progress/--no-progress', default=True)
+def sink(output_file, port, continuous, progress):
 
     context = zmq.Context()
 
@@ -171,7 +177,10 @@ def sink(output_file, port, continuous):
         count = unpackb(message)
 
         # Receive a set number of results.
-        for entry in tqdm.tqdm(itertools.islice(wrapper(), count), smoothing=0, total=count):
+        delayed = itertools.islice(wrapper(), count)
+        if progress:
+            delayed = tqdm.tqdm(delayed, smoothing=0, total=count)
+        for entry in delayed:
             json.dump(entry, output_file)
             output_file.write('\n')
 
@@ -209,9 +218,10 @@ def ventilator(samples, chunk, source_port, sink_port):
     sink = context.socket(zmq.PUSH)
     sink.connect("tcp://localhost:{}".format(sink_port))
 
-    click.echo("Press Enter when the workers are ready: ")
-    _ = input()
-    click.echo("Sending tasks to workers")
+    time.sleep(1)
+    # click.echo("Press Enter when the workers are ready: ")
+    # _ = input()
+    # click.echo("Sending tasks to workers")
 
     # The first message is "0" and signals start of batch
     encoded = packb(samples)
@@ -267,6 +277,85 @@ def push_pull_worker(specification_file, source_port, sink_port):
         # Pack and send.
         encoded = packb(results)
         sender.send(encoded)
+
+
+@main.command()
+@click.argument('specification-file', type=click.File('r'))
+@click.argument('output-file', type=click.File('w'))
+@click.option('--samples', type=int, prompt=True)
+@click.option('--chunk', type=int, prompt=True)
+@click.option('--workers', type=int, prompt=True)
+@click.option('--source-port', type=int, default=5557)
+@click.option('--sink-port', type=int, default=5558)
+@click.option('--progress/--no-progress', default=True)
+def parallel(specification_file, output_file,
+             samples, chunk, workers,
+             source_port, sink_port,
+             progress):
+
+    # Start workers with the specification.
+    str_spec = specification_file.read()
+    specification = json.loads(str_spec)
+    worker_processes = []
+    for i in range(workers):
+        worker = subprocess.Popen(
+            ['destined', 'push_pull_worker', '-'],
+            encoding='utf-8',
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE)
+        worker.stdin.write(str_spec)
+        worker.stdin.close()
+        click.echo(f'Worker {i+1} PID {worker.pid}', err=True)
+        worker_processes.append(worker)
+
+    # Run the sink in this process.
+    context = zmq.Context()
+    receiver = context.socket(zmq.PULL)
+    receiver.bind("tcp://*:{}".format(sink_port))
+
+    def wrapper():
+        while True:
+            message = receiver.recv()
+            decoded = unpackb(message)
+            for result in decoded:
+                yield result
+
+    # Start the ventilator externally.
+    # This could be internal, i.e.
+    # 1. start workers
+    # 2. connect sink
+    # 3. ventilate
+    # 4. empty sink
+    # Only issue is if the ventilator blocks for some
+    # reason?
+    ventilator = subprocess.Popen(
+        ['destined', 'ventilator', str(samples), str(chunk)],
+        encoding='utf-8',
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE)
+
+    click.echo(f'Ventilator PID {ventilator.pid}', err=True)
+
+    # Collect in sink.
+    message = receiver.recv()
+    count = unpackb(message)
+    delayed = itertools.islice(wrapper(), count)
+    if progress:
+        delayed = tqdm.tqdm(delayed, smoothing=0, total=count)
+    for entry in delayed:
+        json.dump(entry, output_file)
+        output_file.write('\n')
+
+    # Once done the workers can be killed off.
+    for worker in worker_processes:
+        worker.send_signal(signal.SIGINT)
+        worker.wait()
+
+    # This should already be in an exited state, but
+    # make sure it completes.
+    ventilator.wait()
+
 
 
 # make this a common cli decorator

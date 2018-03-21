@@ -1,0 +1,17 @@
+{
+    "instances": {
+        "generator": "sat.uniform_k_sat",
+        "parameters": {
+            "nvariables": {"value": 100},
+            "nclauses": {
+                "generator": "randint",
+                "parameters": {
+                    "low": {"value": 10},
+                    "high": {"value": 1000}
+                }
+            },
+            "clause_length": {"value": 3}
+        }
+    },
+    "attributes": "sat.features"
+}
