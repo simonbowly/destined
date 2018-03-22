@@ -14,20 +14,22 @@ import msgpack
 import tqdm
 import zmq
 
-from destined import evaluate_generator, lookup
+from .distribution import evaluate_distribution
+from .generators import lookup
 
 
 packb = functools.partial(msgpack.packb, use_bin_type=True)
 unpackb = functools.partial(msgpack.unpackb, raw=False)
 
 
-def get_sample_func(specification_file):
-
-    # Load specification from inputs.
-    specification = json.load(specification_file)
+def get_sample_function(specification):
+    ''' Still working on this spec... read a random generator specification
+    (see example files) including evaluation/attribute commands. Returns a
+    function which, given a random seed, generates an instance and returns
+    its attributes. '''
 
     # Generating function taking a randgen object and returning an instance.
-    generate = evaluate_generator(specification['instances'])
+    generate = evaluate_distribution(specification['instances'], lookup)
 
     # Function to evaluate features of the generated instance.
     attributes = lookup(specification['attributes'])
@@ -41,6 +43,22 @@ def get_sample_func(specification_file):
     return sample
 
 
+def system_random_seeds(samples):
+    sysrandom = random.SystemRandom()
+    for _ in range(samples):
+        yield sysrandom.getrandbits(64)
+
+
+def generate_with_system_seeds(specification, samples):
+    ''' Generator function yielding :samples outputs of the specification
+    using system random seeds. '''
+    sysrandom = random.SystemRandom()
+    sample_function = get_sample_function(specification)
+    for _ in range(samples):
+        seed = sysrandom.getrandbits(64)
+        yield sample_function(seed)
+
+
 @click.group()
 def main():
     pass
@@ -48,150 +66,219 @@ def main():
 
 @main.command()
 @click.argument('specification-file', type=click.File('r'))
+@click.argument('samples', type=int)
 @click.argument('output-file', type=click.File('w'))
-@click.option('--samples', type=int, default=1000)
-@click.option('--progress/--no-progress', default=True)
-def evaluate(specification_file, output_file, samples, progress):
-    ''' Serial processor. '''
-
-    # Sampling function built from specification.
-    sample = get_sample_func(specification_file)
-
-    # System random seeds for the given count.
-    sysrandom = random.SystemRandom()
-    system_seeds = [sysrandom.getrandbits(64) for _ in range(samples)]
-
-    # Mapper.
-    delayed = map(sample, system_seeds)
+@click.option('--progress/--no-progress', default=True, help='Show progress bar')
+def evaluate(specification_file, samples, output_file, progress):
+    ''' Generate the given number of samples for the specification using
+    system random seeds. '''
+    specification = json.load(specification_file)
+    results = generate_with_system_seeds(specification, samples)
     if progress:
-        delayed = tqdm.tqdm(delayed, smoothing=0)
-
-    # Run the thing.
-    for entry in delayed:
-        json.dump(entry, output_file)
+        results = tqdm.tqdm(results, total=samples)
+    for result in results:
+        json.dump(result, output_file)
         output_file.write('\n')
+    return 0
 
+
+def worker_response(sample_function, message):
+    ''' Protocol for workers. Expects a msgpack bytes encoded list of integer
+    seed values. Evaluates the given sample function for these seeds, returns
+    msgpack bytes encoded list of attribute dicts.
+    Tests - this should raise an error if either the input is unexpected or
+    the returned data from sample_function is unexpected. '''
+    seeds = unpackb(message)
+    assert type(seeds) is list
+    assert all(type(seed) is int for seed in seeds)
+    results = [sample_function(seed) for seed in seeds]
+    assert all(type(result) is dict for result in results)
+    return packb(results)
+
+
+@main.command()
+@click.argument('specification-file', type=click.File('r'))
+@click.option('--source-port', type=int, default=5557)
+@click.option('--sink-port', type=int, default=5558)
+@click.option('--sub-port', type=int, default=5559)
+def source_sink_worker(specification_file, source_port, sink_port, sub_port):
+    ''' Worker process which loads a generator specification at runtime, then
+    pulls seed values from a source and pushes results to a sink. '''
+    context = zmq.Context()
+    receiver = context.socket(zmq.PULL)
+    receiver.connect("tcp://localhost:{:d}".format(source_port))
+    sender = context.socket(zmq.PUSH)
+    sender.connect("tcp://localhost:{:d}".format(sink_port))
+    subscriber = context.socket(zmq.SUB)
+    subscriber.connect("tcp://localhost:{:d}".format(sub_port))
+    subscriber.setsockopt(zmq.SUBSCRIBE, b'')
+    # Poller to enable listening on receiver and subscriber.
+    poller = zmq.Poller()
+    poller.register(receiver, zmq.POLLIN)
+    poller.register(subscriber, zmq.POLLIN)
+    # Load the specification and listen for tasks forever.
+    specification = json.load(specification_file)
+    sample_function = get_sample_function(specification)
+    while True:
+        try:
+            socks = dict(poller.poll())
+        except KeyboardInterrupt:
+            break
+        if receiver in socks:
+            message = receiver.recv()
+            response = worker_response(sample_function, message)
+            sender.send(response)
+        if subscriber in socks:
+            message = subscriber.recv()
+            assert message == b''
+            break
+    return 0
+
+
+@main.command()
+@click.argument('samples', type=int)
+@click.argument('chunk', type=int)
+@click.option('--source-port', type=int, default=5557)
+@click.option('--sink-port', type=int, default=5558)
+def ventilator(samples, chunk, source_port, sink_port):
+    ''' Fire off a set number of tasks in chunks of the given size. '''
+    context = zmq.Context()
+    sender = context.socket(zmq.PUSH)
+    sender.bind("tcp://*:{}".format(source_port))
+    # Connect to the sink to synchronise batch start.
+    sink = context.socket(zmq.PUSH)
+    sink.connect("tcp://localhost:{}".format(sink_port))
+    # Wait for everyone to connect...
+    time.sleep(1)
+    # Send the number of tasks distributed to the sink as start signal.
+    sink.send(packb(samples))
+    # Send random seeds to workers in chunks.
+    iter_seeds = system_random_seeds(samples)
+    while True:
+        seeds = list(itertools.islice(iter_seeds, chunk))
+        if len(seeds) == 0:
+            break
+        sender.send(packb(seeds))
+    # Give 0MQ time to deliver
+    time.sleep(1)
+    return 0
+
+
+def sink_wrapper(receiver):
+    ''' Wraps the sink socket, which receives results in chunks, to produce
+    a generator of single results. '''
+    while True:
+        message = receiver.recv()
+        decoded = unpackb(message)
+        for result in decoded:
+            yield result
+
+
+@main.command()
+@click.argument('samples', type=int)
+@click.argument('output-file', type=click.File('w'))
+@click.option('--chunk', type=int, default=10)
+@click.option('--source-port', type=int, default=5557)
+@click.option('--sink-port', type=int, default=5558)
+@click.option('--progress/--no-progress', default=True, help='Show progress bar')
+def ventilate_collect(samples, output_file, chunk,
+                      source_port, sink_port, progress):
+    ''' Launch a seed ventilator and result collector. This is a blind process
+    which does not consider the specification, just sends seeds to workers and
+    collects whatever they return. '''
+    # Run the sink internally for result collection.
+    context = zmq.Context()
+    receiver = context.socket(zmq.PULL)
+    receiver.bind("tcp://*:{}".format(sink_port))
+    # Launch the ventilator externally.
+    ventilator = subprocess.Popen(
+        [
+            'destined', 'ventilator',
+            str(samples), str(chunk),
+            f'--source-port={source_port:d}',
+            f'--sink-port={sink_port:d}'],
+        encoding='utf-8',
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE)
+    click.echo(f'Ventilator PID {ventilator.pid}', err=True)
+    # Wait for synchronisation from the ventilator.
+    message = receiver.recv()
+    assert unpackb(message) == samples
+    # Collect results on sink port until total is reached.
+    results = itertools.islice(sink_wrapper(receiver), samples)
+    if progress:
+        results = tqdm.tqdm(results, smoothing=0, total=samples)
+    for result in results:
+        json.dump(result, output_file)
+        output_file.write('\n')
+    # Wait for the ventilator to terminate (should be complete well before the
+    # workers finished.
+    ventilator.wait()
     return 0
 
 
 @main.command()
 @click.argument('specification-file', type=click.File('r'))
-@click.option('--port', type=int, default=5555)
-def reply_worker(specification_file, port):
-    ''' Worker using a reply pattern. '''
-
-    # Sampling function built from specification.
-    sample = get_sample_func(specification_file)
-
-    # Bind the target socket and start the loop.
+@click.argument('nworkers', type=int)
+@click.option('--source-port', type=int, default=5557)
+@click.option('--sink-port', type=int, default=5558)
+@click.option('--sub-port', type=int, default=5559)
+def run_workers(specification_file, nworkers, source_port, sink_port, sub_port):
+    ''' Launch and manage multiple workers with a given specification. '''
+    # Start a publisher socket to signal workers to stop gracefully.
     context = zmq.Context()
-    socket = context.socket(zmq.REP)
-    socket.bind("tcp://*:{}".format(port))
-
-    while True:
-
-        # Receive a task.
-        message = socket.recv()
-        decoded = unpackb(message)
-        seeds = decoded   # input error handling here
-        # click.echo(f"Processing {len(seeds)} seeds.")
-
-        # Sample for each seed.
-        results = [sample(seed) for seed in seeds]
-
-        # Pack and send.
-        encoded = packb(results)
-        socket.send(encoded)
-
-
-@main.command()
-@click.argument('output-file', type=click.File('w'))
-@click.option('--samples', type=int, default=1000)
-@click.option('--chunk', type=int, default=100)
-@click.option('--port', type=int, default=5555)
-def request_client(output_file, samples, chunk, port):
-    ''' Client using a request pattern. '''
-
-    context = zmq.Context()
-    socket = context.socket(zmq.REQ)
-    socket.connect("tcp://localhost:{}".format(port))
-
-    sysrandom = random.SystemRandom()
-    system_seeds = [sysrandom.getrandbits(64) for _ in range(samples)]
-    iter_seeds = iter(system_seeds)
-
-    def wrapper():
-
+    publisher = context.socket(zmq.PUB)
+    publisher.bind("tcp://*:{:d}".format(sub_port))
+    # Worker processes are launched by writing the specification to
+    # their stdin.
+    specification = specification_file.read()
+    worker_processes = []
+    for i in range(nworkers):
+        worker = subprocess.Popen(
+            [
+                'destined', 'source_sink_worker', '-',
+                f'--source-port={source_port:d}',
+                f'--sink-port={sink_port:d}',
+                f'--sub-port={sub_port:d}'],
+            encoding='utf-8', start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,)
+        worker.stdin.write(specification)
+        worker.stdin.close()
+        worker_processes.append(worker)
+        click.echo(f'Worker {i+1} PID {worker.pid}', err=True)
+    # Signal the user and wait for interrupt signal to shut down workers.
+    click.echo("Workers up. Ctrl+C to shut down.")
+    try:
         while True:
-
-            # Get a chunk of seed data.
-            seeds = list(itertools.islice(iter_seeds, chunk))
-            if len(seeds) == 0:
+            time.sleep(1)
+            # Monitor for any workers which have exited.
+            for worker in worker_processes:
+                returncode = worker.poll()
+                if returncode is not None:
+                    click.echo(f'Worker on {worker.pid} exited with return code {returncode}.')
+                    worker.wait()
+            # Trim any dead workers for the next pass.
+            worker_processes = [worker for worker in worker_processes if worker.poll() is None]
+            if len(worker_processes) == 0:
+                click.echo("All workers have died.")
                 break
-
-            # Send seed values as jobs.
-            encoded = packb(seeds)
-            socket.send(encoded)
-
-            # Get the reply.
-            message = socket.recv()
-            decoded = unpackb(message)
-
-            # Pass results back to the consumer.
-            for result in decoded:
-                yield result
-
-    delayed = wrapper()
-
-    # Run the thing.
-    for entry in tqdm.tqdm(delayed, smoothing=0):
-        json.dump(entry, output_file)
-        output_file.write('\n')
+    except KeyboardInterrupt:
+        click.echo("Shutting down workers.")
+    # Publish shutdown signal to workers and wait for them to exit.
+    publisher.send(b'')
+    for worker in worker_processes:
+        worker.wait()
+        click.echo(f'Worker on {worker.pid} exited with return code {worker.returncode}.')
+    click.echo("Done.")
+    return 0
 
 
 @main.command()
-@click.argument('output-file', type=click.File('w'))
 @click.option('--port', type=int, default=5558)
-@click.option('--continuous/--no-continuous', default=False)
-@click.option('--progress/--no-progress', default=True)
-def sink(output_file, port, continuous, progress):
-
-    context = zmq.Context()
-
-    # Socket to receive messages on.
-    receiver = context.socket(zmq.PULL)
-    receiver.bind("tcp://*:{}".format(port))
-
-    def wrapper():
-        while True:
-            message = receiver.recv()
-            decoded = unpackb(message)
-            for result in decoded:
-                yield result
-
-    while True:
-        # Wait for start of batch signal from ventilator.
-        # This signal tells the sink how many results to expect (but
-        # nothing about how they are batched).
-        message = receiver.recv()
-        count = unpackb(message)
-
-        # Receive a set number of results.
-        delayed = itertools.islice(wrapper(), count)
-        if progress:
-            delayed = tqdm.tqdm(delayed, smoothing=0, total=count)
-        for entry in delayed:
-            json.dump(entry, output_file)
-            output_file.write('\n')
-
-        if not continuous:
-            break
-
-
-@main.command()
-@click.argument('port', type=int)
-@click.argument('output_file', type=click.File('w'))
-def clean_sink(port, output_file):
+def clean_sink(port):
+    ''' Utility function to clean a pull socket if it becomes corrupted. '''
     context = zmq.Context()
     receiver = context.socket(zmq.PULL)
     receiver.bind("tcp://*:{}".format(port))
@@ -201,177 +288,21 @@ def clean_sink(port, output_file):
         sys.stdout.flush()
 
 
-@main.command()
-@click.argument('samples', type=int)
-@click.argument('chunk', type=int)
-@click.option('--source-port', type=int, default=5557)
-@click.option('--sink-port', type=int, default=5558)
-def ventilator(samples, chunk, source_port, sink_port):
-
-    context = zmq.Context()
-
-    # Socket to send messages on.
-    sender = context.socket(zmq.PUSH)
-    sender.bind("tcp://*:{}".format(source_port))
-
-    # Socket with direct access to the sink: used to syncronize start of batch.
-    sink = context.socket(zmq.PUSH)
-    sink.connect("tcp://localhost:{}".format(sink_port))
-
-    time.sleep(1)
-    # click.echo("Press Enter when the workers are ready: ")
-    # _ = input()
-    # click.echo("Sending tasks to workers")
-
-    # The first message is "0" and signals start of batch
-    encoded = packb(samples)
-    sink.send(encoded)
-
-    # Create the seed data.
-    sysrandom = random.SystemRandom()
-    system_seeds = [sysrandom.getrandbits(64) for _ in range(samples)]
-    iter_seeds = iter(system_seeds)
-
-    # Send in chunks.
-    while True:
-        seeds = list(itertools.islice(iter_seeds, chunk))
-        if len(seeds) == 0:
-            break
-        encoded = packb(seeds)
-        sender.send(encoded)
-
-    # Give 0MQ time to deliver
-    time.sleep(1)
-
-
-@main.command()
-@click.argument('specification-file', type=click.File('r'))
-@click.option('--source-port', type=int, default=5557)
-@click.option('--sink-port', type=int, default=5558)
-def push_pull_worker(specification_file, source_port, sink_port):
-
-    sample = get_sample_func(specification_file)
-
-    context = zmq.Context()
-
-    # Socket to receive messages on
-    receiver = context.socket(zmq.PULL)
-    receiver.connect("tcp://localhost:{}".format(source_port))
-
-    # Socket to send messages to
-    sender = context.socket(zmq.PUSH)
-    sender.connect("tcp://localhost:{}".format(sink_port))
-
-    # Process tasks forever
-    while True:
-
-        # Receive a task.
-        message = receiver.recv()
-        decoded = unpackb(message)
-        seeds = decoded   # input error handling here
-        # click.echo(f"Processing {len(seeds)} seeds.")
-
-        # Sample for each seed.
-        results = [sample(seed) for seed in seeds]
-
-        # Pack and send.
-        encoded = packb(results)
-        sender.send(encoded)
-
-
-@main.command()
-@click.argument('specification-file', type=click.File('r'))
-@click.argument('output-file', type=click.File('w'))
-@click.option('--samples', type=int, prompt=True)
-@click.option('--chunk', type=int, prompt=True)
-@click.option('--workers', type=int, prompt=True)
-@click.option('--source-port', type=int, default=5557)
-@click.option('--sink-port', type=int, default=5558)
-@click.option('--progress/--no-progress', default=True)
-def parallel(specification_file, output_file,
-             samples, chunk, workers,
-             source_port, sink_port,
-             progress):
-
-    # Start workers with the specification.
-    str_spec = specification_file.read()
-    specification = json.loads(str_spec)
-    worker_processes = []
-    for i in range(workers):
-        worker = subprocess.Popen(
-            ['destined', 'push_pull_worker', '-'],
-            encoding='utf-8',
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.PIPE)
-        worker.stdin.write(str_spec)
-        worker.stdin.close()
-        click.echo(f'Worker {i+1} PID {worker.pid}', err=True)
-        worker_processes.append(worker)
-
-    # Run the sink in this process.
-    context = zmq.Context()
-    receiver = context.socket(zmq.PULL)
-    receiver.bind("tcp://*:{}".format(sink_port))
-
-    def wrapper():
-        while True:
-            message = receiver.recv()
-            decoded = unpackb(message)
-            for result in decoded:
-                yield result
-
-    # Start the ventilator externally.
-    # This could be internal, i.e.
-    # 1. start workers
-    # 2. connect sink
-    # 3. ventilate
-    # 4. empty sink
-    # Only issue is if the ventilator blocks for some
-    # reason?
-    ventilator = subprocess.Popen(
-        ['destined', 'ventilator', str(samples), str(chunk)],
-        encoding='utf-8',
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE)
-
-    click.echo(f'Ventilator PID {ventilator.pid}', err=True)
-
-    # Collect in sink.
-    message = receiver.recv()
-    count = unpackb(message)
-    delayed = itertools.islice(wrapper(), count)
-    if progress:
-        delayed = tqdm.tqdm(delayed, smoothing=0, total=count)
-    for entry in delayed:
-        json.dump(entry, output_file)
-        output_file.write('\n')
-
-    # Once done the workers can be killed off.
-    for worker in worker_processes:
-        worker.send_signal(signal.SIGINT)
-        worker.wait()
-
-    # This should already be in an exited state, but
-    # make sure it completes.
-    ventilator.wait()
-
-
-
-# make this a common cli decorator
-# @click.argument('specification-file', type=click.File('r'))
-# sample = get_sample_func(specification_file)
-
-# Run sink and ventilator as async tasks of the same process.
-# That way the ventilator can dispatch based on what the sink
-# has received, monitor progress together, etc, without extra
-# processes?
-# This could also verify that all dispatched tasks were recieved,
-# and monitor any missed seeds.
-# But this feels more like a router approach anyway...
-
-# How to check if a port is 'clean' so that there are no workers
-# with a different specification loaded which could leak messages.
-
-if __name__ == "__main__":
-    sys.exit(main())  # pragma: no cover
+# TODO
+#
+# Combined parallel evaluation. Launch workers with start_new_session,
+# launch ventilator externally, collect in main process.
+# Shutdown process:
+#   1. Shutdown ventilator (avoids leaving seeds in worker source pipe).
+#      signal.SIGINT & wait for exit is fine here.
+#   2. Publish kill signal to workers, wait for them to exit (avoids leaving
+#      results in sink pipe).
+#   3. Exit gracefully.
+#
+# socket.close() and context.destroy() with sensible finally handling.
+#
+# Verify workers return the right spec?
+#
+# Make a --parallel/--workers option for zmq parallel evaluation. Move the
+# more complex cli elements to a separate script destined-parallel
+#

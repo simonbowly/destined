@@ -39,5 +39,11 @@ Nest distribution specifications to vary parameters.
         }
     }
 
+Sample from the distribution using system seeds.
+
+.. code:: sh
+
+    destined evaluate examples/random-3sat.json 1000 -
+
 
 * Free software: MIT license
