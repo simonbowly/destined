@@ -9,7 +9,9 @@ with open('README.rst') as readme_file:
 requirements = [
     'click>=6.0',
     'networkx>=2.1',
-    'tqdm>=4.19',
+    'tqdm>=4.19.7',
+    'msgpack>=0.5.6',
+    'pyzmq>=17.0'
     ]
 
 setup_requirements = [
