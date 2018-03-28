@@ -359,16 +359,18 @@ does not apply to the bind side?
 @click.option('--source-port', type=int, default=5557)
 @click.option('--sink-port', type=int, default=5558)
 @click.option('--sub-port', type=int, default=5559)
-def source_sink_worker(specification_file, source_port, sink_port, sub_port):
+@click.option('--host', type=str, default='localhost')
+def source_sink_worker(specification_file, source_port, sink_port, sub_port, host):
     ''' Worker process which loads a generator specification at runtime, then
     pulls seed values from a source and pushes results to a sink. '''
     context = zmq.Context()
     receiver = context.socket(zmq.PULL)
-    receiver.connect("tcp://localhost:{:d}".format(source_port))
+    receiver.connect(f"tcp://{host}:{source_port:d}")
     sender = context.socket(zmq.PUSH)
-    sender.connect("tcp://localhost:{:d}".format(sink_port))
+    sender.connect(f"tcp://{host}:{sink_port:d}")
     subscriber = context.socket(zmq.SUB)
-    subscriber.connect("tcp://localhost:{:d}".format(sub_port))
+    # Localhost controls shutdown
+    subscriber.connect(f"tcp://localhost:{sub_port:d}")
     subscriber.setsockopt(zmq.SUBSCRIBE, b'')
     # Poller to enable listening on receiver and subscriber.
     poller = zmq.Poller()
@@ -481,7 +483,7 @@ def ventilate_collect(samples, output_file, chunk,
 
 
 @contextlib.contextmanager
-def launch_workers(context, nworkers, specification, source_port, sink_port, sub_port):
+def launch_workers(context, nworkers, specification, source_port, sink_port, sub_port, host):
     ''' Launches worker processes. Uses pub-sub channel to signal worker
     shutdown. All communication on the publisher socket only occurs within
     this context, so publisher can be closed. '''
@@ -493,10 +495,12 @@ def launch_workers(context, nworkers, specification, source_port, sink_port, sub
     for i in range(nworkers):
         worker = subprocess.Popen(
             [
-                'destined', 'source_sink_worker', '-',
+                '/home/simon/.virtualenvs/py36/bin/destined',
+                'source_sink_worker', '-',
                 f'--source-port={source_port:d}',
                 f'--sink-port={sink_port:d}',
-                f'--sub-port={sub_port:d}'],
+                f'--sub-port={sub_port:d}',
+                f'--host={host}'],
             encoding='utf-8', start_new_session=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -524,19 +528,21 @@ def launch_workers(context, nworkers, specification, source_port, sink_port, sub
 @click.option('--source-port', type=int, default=5557)
 @click.option('--sink-port', type=int, default=5558)
 @click.option('--sub-port', type=int, default=5559)
-def run_workers(specification_file, nworkers, source_port, sink_port, sub_port):
+@click.option('--host', type=str, default='localhost')
+def run_workers(specification_file, nworkers, source_port, sink_port, sub_port, host):
     ''' Launch and manage multiple workers with a given specification. '''
     context = zmq.Context()
     with launch_workers(
             context, nworkers, specification_file.read(),
-            source_port, sink_port, sub_port) as workers:
+            source_port, sink_port, sub_port, host) as workers:
         click.echo("Workers up. Ctrl+C to shut down.")
         try:
-            while True:
-                time.sleep(1)
-                click.echo(str({
-                    worker.pid: worker.poll()
-                    for worker in workers}))
+            signal.pause()
+            #while True:
+            #    time.sleep(1)
+            #    click.echo(str({
+            #        worker.pid: worker.poll()
+            #        for worker in workers}))
         except KeyboardInterrupt:
             click.echo("Shutting down workers.")
     context.destroy()
