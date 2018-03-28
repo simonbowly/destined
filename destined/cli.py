@@ -409,7 +409,8 @@ def ventilator(samples, chunk, source_port, sink_port):
     sink = context.socket(zmq.PUSH)
     sink.connect("tcp://localhost:{}".format(sink_port))
     # Wait for everyone to connect...
-    time.sleep(1)
+    click.echo("Press Enter when workers are ready...")
+    _ = input()
     # Send the number of tasks distributed to the sink as start signal.
     sink.send(packb(samples))
     # Send random seeds to workers in chunks.
@@ -442,12 +443,10 @@ def sink_wrapper(receiver):
 @main.command()
 @click.argument('samples', type=int)
 @click.argument('output-file', type=click.File('w'))
-@click.option('--chunk', type=int, default=10)
 @click.option('--source-port', type=int, default=5557)
 @click.option('--sink-port', type=int, default=5558)
 @click.option('--progress/--no-progress', default=True, help='Show progress bar')
-def ventilate_collect(samples, output_file, chunk,
-                      source_port, sink_port, progress):
+def collect(samples, output_file, source_port, sink_port, progress):
     ''' Launch a seed ventilator and result collector. This is a blind process
     which does not consider the specification, just sends seeds to workers and
     collects whatever they return. '''
@@ -455,17 +454,6 @@ def ventilate_collect(samples, output_file, chunk,
     context = zmq.Context()
     receiver = context.socket(zmq.PULL)
     receiver.bind("tcp://*:{}".format(sink_port))
-    # Launch the ventilator externally.
-    ventilator = subprocess.Popen(
-        [
-            'destined', 'ventilator',
-            str(samples), str(chunk),
-            f'--source-port={source_port:d}',
-            f'--sink-port={sink_port:d}'],
-        encoding='utf-8',
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE)
-    click.echo(f'Ventilator PID {ventilator.pid}', err=True)
     # Wait for synchronisation from the ventilator.
     message = receiver.recv()
     assert unpackb(message) == samples
@@ -478,7 +466,6 @@ def ventilate_collect(samples, output_file, chunk,
         output_file.write('\n')
     # Wait for the ventilator to terminate (should be complete well before the
     # workers finished.
-    ventilator.wait()
     return 0
 
 

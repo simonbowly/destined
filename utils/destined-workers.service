@@ -1,0 +1,9 @@
+[Unit]
+Description=Destined Workers
+
+[Service]
+Type=simple
+ExecStart=destined run_workers /path/to/destined/examples/random-3sat.json 2
+
+[Install]
+WantedBy=multi-user.target
